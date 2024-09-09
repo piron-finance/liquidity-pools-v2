@@ -3,13 +3,13 @@ pragma solidity 0.8.22;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/IEscrow.sol";
 import "./interfaces/ILiquidityPool.sol";
-import "hardhat/console.sol";
+// import "hardhat/console.sol";
 
 contract InvestmentManager {
-    using SafeMath for uint256;
+    using Math for uint256;
     using SafeERC20 for IERC20;
 
     struct InvestorState {
@@ -20,13 +20,14 @@ contract InvestmentManager {
     }
 
     struct EpochState {
-        uint256 startTime;
-        uint256 endTime;
-        uint256 totalDeposits;
-        uint256 totalShares;
-        bool fundsEscrowed;
-        bool matured;
-    }
+    uint256 startTime;
+    uint256 endTime;
+    uint256 totalDeposits;
+    uint256 totalShares;
+    uint256 totalReturn;
+    bool fundsEscrowed;
+    bool matured;
+}
 
     mapping(address => mapping(address => InvestorState)) public investorStates;
     mapping(address => EpochState) public epochStates;
@@ -51,15 +52,19 @@ contract InvestmentManager {
 
      function startEpoch(address liquidityPool) external {
         require(epochStates[liquidityPool].endTime < block.timestamp, "Current epoch not ended");
+        uint256 startTime = block.timestamp;
+         (bool success, uint256 endTime) = startTime.tryAdd(EPOCH_DURATION);
+    require(success, "Epoch end time calculation overflow");
         epochStates[liquidityPool] = EpochState({
-            startTime: block.timestamp,
-            endTime: block.timestamp.add(EPOCH_DURATION),
+            startTime: startTime,
+            endTime: endTime,
             totalDeposits: 0,
             totalShares: 0,
             fundsEscrowed: false,
-            matured: false
+            matured: false,
+            totalReturn: 0
         });
-        emit EpochStarted(liquidityPool, block.timestamp, block.timestamp.add(EPOCH_DURATION));
+        emit EpochStarted(liquidityPool, startTime, endTime);
     }
 
    
@@ -72,7 +77,7 @@ contract InvestmentManager {
             isInvestor[liquidityPool][owner] = true;
         }
 
-        state.pendingDeposit = state.pendingDeposit.add(amount);
+        state.pendingDeposit = state.pendingDeposit.tryAdd(amount);
         epochStates[liquidityPool].totalDeposits = epochStates[liquidityPool].totalDeposits.add(amount);
 
         shares = convertToShares(liquidityPool, amount);
@@ -173,7 +178,7 @@ function _calculateReturns(address liquidityPool) internal {
     uint256 interest = totalDeposits.mul(interestRate).div(100);
     uint256 totalReturn = totalDeposits.add(interest);
     
-    epochStates[liquidityPool].totalShares = totalReturn;
+    epochStates[liquidityPool].totalReturn = totalReturn;
     
     // emit ReturnsCalculated(liquidityPool, totalReturn);
 }
@@ -198,28 +203,31 @@ function _calculateReturns(address liquidityPool) internal {
         emit FundsEscrowed(liquidityPool, totalDeposits);
     }
 
-function withdraw(address liquidityPool, address receiver, uint256 shares) external returns (uint256) {
+function withdraw(address liquidityPool, address receiver, uint256 assets) external returns (uint256 shares) {
     require(epochStates[liquidityPool].matured, "Not matured yet");
     InvestorState storage state = investorStates[liquidityPool][receiver];
+    
+    uint256 totalDeposits = epochStates[liquidityPool].totalDeposits;
+    uint256 totalReturn = epochStates[liquidityPool].totalReturn;
+    uint256 maxWithdrawable = state.shares.mul(totalReturn).div(totalDeposits);
+    
+    require(assets <= maxWithdrawable, "Insufficient balance");
+    
+    shares = assets.mul(totalDeposits).div(totalReturn);
     require(state.shares >= shares, "Insufficient shares");
 
-    uint256 totalShares = epochStates[liquidityPool].totalShares;
-    uint256 totalReturn = IERC20(ILiquidityPool(liquidityPool).asset()).balanceOf(address(escrow));
-    uint256 withdrawAmount = shares.mul(totalReturn).div(totalShares);
-
     state.shares = state.shares.sub(shares);
-    state.depositedAmount = state.depositedAmount.sub(withdrawAmount);
-    epochStates[liquidityPool].totalShares = totalShares.sub(shares);
+    epochStates[liquidityPool].totalShares = epochStates[liquidityPool].totalShares.sub(shares);
 
     IERC20 asset = IERC20(ILiquidityPool(liquidityPool).asset());
-    escrow.transferOut(address(asset), receiver, withdrawAmount);
+    escrow.transferOut(address(asset), receiver, assets);
 
     if (state.shares == 0) {
         removeInvestor(liquidityPool, receiver);
     }
 
-    emit Withdrawal(liquidityPool, receiver, withdrawAmount, shares);
-    return withdrawAmount;
+    emit Withdrawal(liquidityPool, receiver, assets, shares);
+    return shares;
 }
 
 
@@ -249,10 +257,10 @@ function withdraw(address liquidityPool, address receiver, uint256 shares) exter
     require(epochStates[liquidityPool].matured, "Epoch not matured yet");
     InvestorState storage state = investorStates[liquidityPool][investor];
     
-    uint256 totalShares = epochStates[liquidityPool].totalShares;
-    uint256 totalReturn = IERC20(ILiquidityPool(liquidityPool).asset()).balanceOf(address(escrow));
+    uint256 totalDeposits = epochStates[liquidityPool].totalDeposits;
+    uint256 totalReturn = epochStates[liquidityPool].totalReturn;
     
-    return state.shares.mul(totalReturn).div(totalShares);
+    return state.shares.mul(totalReturn).div(totalDeposits);
 }
 
 
@@ -263,9 +271,13 @@ function withdraw(address liquidityPool, address receiver, uint256 shares) exter
     }
 
     function convertToAssets(address liquidityPool, uint256 shares) public view returns (uint256) {
-        EpochState storage epoch = epochStates[liquidityPool];
-        return epoch.totalShares == 0 ? shares : shares.mul(epoch.totalDeposits).div(epoch.totalShares);
+    EpochState storage epoch = epochStates[liquidityPool];
+    if (epoch.matured) {
+        return shares.mul(epoch.totalReturn).div(epoch.totalDeposits);
+    } else {
+        return shares;
     }
+}
 
 
 
